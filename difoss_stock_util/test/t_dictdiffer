@@ -1,0 +1,13 @@
+from dictdiffer import diff
+
+dict1 = {'a': 1, 'b': 2, 'c': 3}
+dict2 = {'a': 1, 'b': 4, 'd': 5}
+
+# 比较差异
+result = list(diff(dict1, dict2))
+print("DictDiffer 结果:")
+for change_type, path, values in result:
+    print(f"{change_type}: {path} -> {values}")
+
+
+print(list(diff(dict1, dict1)))
