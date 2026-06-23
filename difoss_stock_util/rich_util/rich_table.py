@@ -172,6 +172,60 @@ def dataframe_to_rich_table_v0(df: pd.DataFrame,
 
     return table
 
+
+# 颜色轮换序列（用于 list 中 | 分隔的元素着色）
+_LIST_COLOR_CYCLE = [
+    "cyan",
+    "green",
+    "yellow",
+    "magenta",
+    "bright_cyan",
+    "bright_green",
+    "bright_yellow",
+    "bright_magenta",
+    "blue",
+    "red",
+]
+
+
+def _format_cell_value(value, flatten_list: bool = True) -> str:
+    """
+    格式化单元格值。若 flatten_list=True 且值为容器类型（list/array/tuple/set）：
+      - 元素以空格连接，不显示 []
+      - 若元素含 |，则按 | 拆分后依次着色
+    """
+    if not flatten_list:
+        return str(value)
+
+    # 排除不应被扁平化的类型
+    if isinstance(value, (str, dict, pd.DataFrame)):
+        return str(value)
+
+    # 尝试转为 list（兼容 np.ndarray / tuple / set / frozenset 等）
+    try:
+        items = list(value)
+    except TypeError:
+        return str(value)
+
+    # 转 list 后：空列表显示为空，单元素和多元素统一用空格连接
+    if not items:
+        return ''
+
+    parts = []
+    for item in items:
+        item_str = str(item)
+        if '|' in item_str:
+            # 按 | 拆分，每段用不同颜色包裹
+            colored_segments = []
+            for i, seg in enumerate(item_str.split('|')):
+                color = _LIST_COLOR_CYCLE[i % len(_LIST_COLOR_CYCLE)]
+                colored_segments.append(f"[{color}]{seg}[/{color}]")
+            parts.append(' '.join(colored_segments))
+        else:
+            parts.append(item_str)
+    return ' '.join(parts)
+
+
 def dataframe_to_rich_table(df: pd.DataFrame,
                             title: str = "DataFrame 表格",
                             decimal_point: int = 2,
@@ -179,6 +233,9 @@ def dataframe_to_rich_table(df: pd.DataFrame,
                             show_index: bool = False,
                             show_footer: bool = False,
                             footer_options: dict = None,
+                            flatten_list: bool = True,
+                            include_cols: list[str] = [],
+                            exclude_cols: list[str] = [],
                             sum_cols: list[str] = [],   # 新增参数，指定要显示合计的列
 ) -> Table:
     """将 Pandas DataFrame 转换为 Rich Table（带详细footer）
@@ -196,8 +253,18 @@ def dataframe_to_rich_table(df: pd.DataFrame,
             - show_memory: 是否显示内存使用
             - show_na: 是否显示缺失值信息
             - custom_text: 自定义footer文本
+        flatten_list: 列表扁平化处理（元素会以“|”作进一步分隔并依次以不同颜色显示）
+        include_cols: 仅显示的列名列表（精确匹配），空列表表示不过滤
+        exclude_cols: 排除的列名列表（精确匹配），空列表表示不过滤
         sum_cols: 需要显示合计的列名列表，合计值会显示在表头下方的第一行
     """
+
+    # 列过滤：include_cols 非空则只保留匹配列，exclude_cols 非空则排除匹配列
+    _cols = list(df.columns)
+    if include_cols:
+        _cols = [c for c in _cols if str(c) in include_cols]
+    if exclude_cols:
+        _cols = [c for c in _cols if str(c) not in exclude_cols]
 
     # 创建表格
     table = Table(title=title, show_header=True, header_style="bold blue")
@@ -246,9 +313,10 @@ def dataframe_to_rich_table(df: pd.DataFrame,
         columns_to_add.append("INDEX")
 
     # 添加数据列
-    for column in df.columns:
+    for column in _cols:
         # 判断该列是否需要显示合计
         col_style = "cyan"
+
         if column in col_sums:
             col_style = "bold yellow"  # 高亮显示有合计的列
         table.add_column(str(column), style=col_style)
@@ -272,7 +340,7 @@ def dataframe_to_rich_table(df: pd.DataFrame,
                 sum_row.append("[dim]—[/dim]")  # 不显示合计
 
         # 数据列的合计
-        for column in df.columns:
+        for column in _cols:
             if column in col_sums:
                 sum_value = col_sums[column]
                 # 格式化合计值
@@ -306,9 +374,10 @@ def dataframe_to_rich_table(df: pd.DataFrame,
         value_keywords = {'价', '值', '额', '格', '成本', '收入', '利润'}
         amount_keywords = {'量', '数', '手', '股', '份', '笔'}
 
-        # 格式化数据
-        for column_i, value in enumerate(row):
-            column_str = str(df.columns[column_i])
+        # 格式化数据（仅遍历显示列）
+        for column_str in _cols:
+            column_str = str(column_str)
+            value = row[column_str]
 
             # 判断列类型并应用格式
             is_percent = any(keyword in column_str for keyword in percent_keywords)
@@ -339,6 +408,7 @@ def dataframe_to_rich_table(df: pd.DataFrame,
                 else:
                     formatted_value = str(value)
 
+
                 # 为整数也添加颜色（如果是数值类型）
                 if is_amount:
                     color = "red" if (positive_is_red ^ (value < 0)) else "green"
@@ -346,7 +416,7 @@ def dataframe_to_rich_table(df: pd.DataFrame,
                 else:
                     formatted_value = f"[white]{formatted_value}[/white]"
             else:
-                formatted_value = str(value)
+                formatted_value = _format_cell_value(value, flatten_list=flatten_list)
 
             formatted_row.append(formatted_value)
 
@@ -420,6 +490,9 @@ def print_dataframe(df: pd.DataFrame,
     printer = None,
     show_index = True,
     sum_cols: list[str] = [],
+    include_cols: list[str] = [],
+    exclude_cols: list[str] = [],
+    flatten_list: bool = True,
     **args
 ):
     """打印DataFrame的内容"""
@@ -431,7 +504,9 @@ def print_dataframe(df: pd.DataFrame,
     if len(df) > table_max_rows:
         printer(f"{title}", df)
     else:
-        printer(dataframe_to_rich_table(df, title=title, show_index=show_index, sum_cols=sum_cols, **args))
+        printer(dataframe_to_rich_table(df, title=title, show_index=show_index, flatten_list=flatten_list, 
+                                        sum_cols=sum_cols, include_cols=include_cols, exclude_cols=exclude_cols,
+                                        **args))
 
 
 def check_text_in_column(df: pd.DataFrame, column_name: str, finds: list[str]) -> pd.DataFrame:
