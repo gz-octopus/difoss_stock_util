@@ -223,7 +223,7 @@ def _format_cell_value(value, flatten_list: bool = True) -> str:
             parts.append(' '.join(colored_segments))
         else:
             parts.append(item_str)
-    return ' '.join(parts)
+    return '  '.join(parts)
 
 
 def dataframe_to_rich_table(df: pd.DataFrame,
