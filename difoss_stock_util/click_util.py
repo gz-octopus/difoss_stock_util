@@ -33,11 +33,13 @@
 #   【修复】手动修复 completions 列表产生时没有强制转换成 str 类型的问题，从而避免了当 Choice 定义的选项值不是字符串时，提示功能失效的问题。
 # - v1.3.3 (2026-05-25): 修复 Ctrl+C 的问题（在执行子命令或提示符后有字符时，不作退出）。
 # - v1.3.4 (2026-05-26): 添加字段过滤功能的装饰器。
-# - v1.3.5 (2026-05-28): 
+# - v1.3.5 (2026-05-28):
 # 【新增】history 命令支持通过 "!行号" 的方式执行历史命令。
 # 【修复】history 命令显示历史记录时的行号错误问题，现在以历史文件中行号的倒序显示（保持bash习惯）。
 # - v1.3.6 (2026-06-08)
 # 【添加】history 命令新增支持 --contain/-c 参数（--clear参数的短参数-c废弃），用于根据该参数过滤历史命令。
+# - v1.3.7 (2026-06-26)
+# 【添加】子命令管道(|) 的功能
 
 
 __all__ = [
@@ -335,17 +337,17 @@ def history(_ctx: click.Context,
         return
 
     _number_for_search = number
-    if all: 
+    if all:
         number = 0  # 显示所有记录
         _number_for_search = 0
     if contain:  # 需要查找的时候，也需要覆盖所有记录
         _number_for_search = 0
-        
+
     # 逻辑修改：如果指定了 number，我们只取最后 N 条，但要保留它们的原始索引
     # enumerate 从 1 开始
     indexed_lines = list(enumerate(lines, 1))
     display_lines = indexed_lines[-_number_for_search:] if _number_for_search and _number_for_search > 0 else indexed_lines
-    
+
     index_2_lines = {}
 
     # 显示带行号的格式
@@ -355,7 +357,7 @@ def history(_ctx: click.Context,
                 index_2_lines.update({idx: line})
         else:
             index_2_lines.update({idx: line})
-    
+
     for idx, line in index_2_lines.items():
         console.print(f'[dim]{idx:5d} │[/dim] {line}')
 
@@ -431,6 +433,117 @@ def auto_register_commands(group: click.Group, cmds: dict[str, click.Command] = 
 # 重构后的交互模式逻辑
 # ---------------------------------------------------------------------------------------------
 from prompt_toolkit.history import InMemoryHistory
+
+def split_by_pipe(line: str) -> list[list[str]]:
+    """按管道符 | 分割命令行，尊重引号内的 | 字面量。
+
+    使用 shlex.shlex 词法分析器，引号内的 | 会被视为普通字符而不会被分割。
+
+    >>> split_by_pipe('cmd --name "hello | world" | cmd2 -a b')
+    [['cmd', '--name', 'hello | world'], ['cmd2', '-a', 'b']]
+
+    >>> split_by_pipe('cmd1')            # 无管道 → 单段
+    [['cmd1']]
+    """
+    lex = shlex.shlex(line, posix=True)
+    lex.whitespace_split = True
+    lex.commenters = ''
+
+    segments = []
+    current = []
+
+    for token in lex:
+        if token == '|':
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(token)
+
+    if current:
+        segments.append(current)
+
+    # 确保至少返回一个空列表（输入为纯空白时）
+    return segments if segments else [[]]
+
+
+def _execute_pipe(pipe_segments: list[list[str]], group: click.Group, ctx: click.Context, console: Console):
+    """
+    管道链式执行引擎。
+
+    上游命令返回的 dict 中每个 key 会自动匹配下游命令的 Click 参数名
+    (param.name)，匹配成功且用户未显式传参时自动注入到下游 args。
+    完整返回值同时存入 pipe_ctx_obj['_pipe_data'] 供下游命令显式读取
+    （如 DataFrame 等复杂类型无法拼入命令行，只能通过此方式传递）。
+
+    特性：
+    - 克隆 ctx.obj 隔离管道内上下文，不污染主 REPL 的 obj
+    - 通过 _pipe_producer 标志通知上游命令自动返回数据（无需 -sm）
+    - 下游显式传参优先，不覆盖
+    - 支持任意 key（stocks、codes、blocks...），无需修改管道引擎
+    """
+    # 1. 临时为管道环境克隆主上下文 obj，杜绝数据跨模块污染与持久化耦合
+    pipe_ctx_obj = ctx.obj.copy() if ctx.obj else {}
+    last_pipe_result = None  # 用于向后流转上游命令的 return 返回值
+
+    for idx, args in enumerate(pipe_segments):
+        if not args:
+            continue
+
+        # 2. 标记当前子命令是否是数据生产者（只要后面还有子命令，当前就是生产者）
+        is_last = (idx == len(pipe_segments) - 1)
+        pipe_ctx_obj['_pipe_producer'] = not is_last
+
+        # 3. 🚀 通用注入：上游返回值 dict 的每个 key 自动匹配下游命令的 Click 参数名
+        if idx > 0 and last_pipe_result and isinstance(last_pipe_result, dict):
+            # 暴露完整返回值，供下游命令通过 ctx.obj['_pipe_data'] 显式读取
+            pipe_ctx_obj['_pipe_data'] = last_pipe_result
+
+            # 查找下游命令
+            cmd_name = args[0]
+            downstream_cmd = group.get_command(ctx, cmd_name)
+
+            if downstream_cmd:
+                # 收集下游命令中用户已显式传参的参数名（避免覆盖）
+                explicit_names = set()
+                for param in downstream_cmd.params:
+                    if isinstance(param, click.Option) and any(o in args for o in param.opts):
+                        explicit_names.add(param.name)
+
+                for key, value in last_pipe_result.items():
+                    if key in explicit_names:
+                        continue
+                    # 仅注入简单可迭代类型（list/set/tuple），DataFrame 等走 _pipe_data
+                    if not isinstance(value, (list, set, tuple)) or not value:
+                        continue
+
+                    # 在下游命令的 params 中查找 param.name 匹配的 Option
+                    for param in downstream_cmd.params:
+                        if isinstance(param, click.Option) and param.name == key:
+                            long_opt = next((o for o in param.opts if o.startswith('--')), param.opts[0])
+                            args.extend([long_opt, ','.join(str(v) for v in value)])
+                            break
+
+        # 4. 顺序调用当前被动态注入参数后的 Click 链条
+        try:
+            # 必须维持 standalone_mode=False，Click 才会把函数的返回数据抛出来供下游消费
+            last_pipe_result = group.main(
+                args=args,
+                standalone_mode=False,
+                obj=pipe_ctx_obj
+            )
+        except click.Abort:
+            # 用户主动中断（Ctrl+C），向上传播让 REPL 层处理
+            raise
+        except click.ClickException as e:
+            # Click 参数校验等错误，显示后终止管道
+            e.show()
+            break
+        except Exception:
+            # 业务代码意外崩溃，打印完整堆栈便于定位
+            console.print(f"[red]❌ 管道命令在第 {idx+1} 段 [bold]{args[0]}[/bold] 运行时异常[/red]")
+            console.print_exception(extra_lines=5, show_locals=True)
+            break
 
 def run_modern_repl(group: click.Group, ctx: click.Context, prompt: str, hist_file: str, console: Console = None):
     """
@@ -539,7 +652,11 @@ def run_modern_repl(group: click.Group, ctx: click.Context, prompt: str, hist_fi
             if str(text).lower() in ('exit', 'quit'):
                 break
 
-            # 新增: !行号 执行逻辑
+            text = str(text)
+
+            # =========================================================================
+            # 1. 拦截并处理 "!行号" 直接执行历史记录逻辑
+            # =========================================================================
             if text.startswith('!'):
                 try:
                     target_idx = int(text[1:])
@@ -554,23 +671,35 @@ def run_modern_repl(group: click.Group, ctx: click.Context, prompt: str, hist_fi
                     console.print(f"[red]错误: ! 后面必须接数字[/red]")
                     continue
 
-            # 解析并执行命令
-            args = shlex.split(text)
+            # =========================================================================
+            # 2. 拦截并处理 临时匿名管道 "|" 运算逻辑
+            # =========================================================================
 
-            # 执行命令：如果输入了错误的命令，会在此处触发异常跳入 except 块，不计入历史
-            group.main(args=args, standalone_mode=False, obj=ctx.obj)
+            # 解析命令（支持管道 | 分割，自动处理引号内的 |）
+            pipe_segments = split_by_pipe(text)
+
+
+            # 提取第一条命令的首词，供历史记录过滤使用
+            first_word = ''
+            if pipe_segments and pipe_segments[0]:
+                first_word = pipe_segments[0][0].strip().lower()
+
+            if len(pipe_segments) == 1:
+                # 无管道：单命令执行（与原有行为完全一致）
+                group.main(args=pipe_segments[0],
+                           standalone_mode=False, obj=ctx.obj)
+            else:
+                # 管道模式：依次执行各段命令，自动传递结果
+                _execute_pipe(pipe_segments, group, ctx, console)
 
             # 成功执行的非黑名单命令才进行持久化记录
-            if args:
-                first_word = args[0].strip().lower()
-                excluded_cmds = {'history', 'h', 'cmd', 'c', 'help'}
-
-                if first_word not in excluded_cmds:
-                    try:
-                        with open(hist_path, 'a', encoding='utf-8') as f:
-                            f.write(text + '\n')
-                    except Exception:
-                        pass
+            excluded_cmds = {'history', 'h', 'cmd', 'c', 'help'}
+            if first_word and first_word not in excluded_cmds:
+                try:
+                    with open(hist_path, 'a', encoding='utf-8') as f:
+                        f.write(text + '\n')
+                except Exception:
+                    pass
 
         except (click.Abort):
             # 用户中断（如 Ctrl+C），安全退出当前命令执行，继续提示输入
@@ -783,7 +912,7 @@ def with_field_filter_options(func=None, *, en2cn_map, cn2en_map):
 
             ctx.obj = ctx.obj or {}
             ctx.obj['list_field_filter'] = filter_list_of_dicts
-            
+
             ret = ctx.invoke(f, *args, **kwargs)
 
             # 如果被请求，装饰器负责显示字段信息（依赖被装饰函数返回样本列表或样本对象）
