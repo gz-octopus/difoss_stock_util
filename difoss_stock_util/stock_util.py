@@ -9,6 +9,7 @@ __all__ = [
     'calc_next_trading_day',
     'calc_previous_trading_day',
     'TradingInfo',
+    'is_st_stock',
 ]
 
 import traceback
@@ -372,13 +373,16 @@ def get_market_cap(context, stock_code):
         return None
 
 
-def is_valid_stock(context, stock_code):
+def is_st_stock(stock_name: str) -> bool:
+    return any(st_flag in stock_name.upper() for st_flag in ['ST', '*ST', '退'])
+
+
+def is_valid_stock(context, stock_code: str) -> bool:
     """判断是否为主板/中小板非ST股票"""
-    import traceback
     try:
         # 获取股票名称（手册 3.2.2.20）
         name = context.get_stock_name(stock_code)
-        if name and any(st_flag in name for st_flag in ['ST', '*ST', '退']):
+        if name and is_st_stock(name):
             return False
 
         # 提取6位代码
